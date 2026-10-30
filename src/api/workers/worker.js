@@ -4,18 +4,29 @@ import {
   recoverExpiredJobs,
   renewJobLease,
 } from "../queues/queue.js";
-import { connectRedis } from "../../config/redis.js";
+import { connectRedis, disconnectRedis } from "../../config/redis.js";
 
 const HEARTBEAT_INTERVAL = 5 * 1000; // 5 seconds
+// For grace full shutdown
+let isShuttingDown = false;
+
+process.on("SIGINT", () => {
+  console.log("\nShutdown signal received (SIGINT)");
+  isShuttingDown = true;
+});
+process.on("SIGTERM", () => {
+  console.log("\nShutdown signal received (SIGTERM)");
+  isShuttingDown = true;
+});
 
 async function startWorker() {
   try {
     await connectRedis();
-    startRecoveryLoop();// Recover expired jobs before claiming a new job
+    const recoveryLoopPromise = startRecoveryLoop(); // Recover expired jobs before claiming a new job
 
     console.log("Worker started");
 
-    while (true) {
+    while (!isShuttingDown) {
       try {
         console.log("Waiting for job...");
 
@@ -34,6 +45,9 @@ async function startWorker() {
         console.error("Worker error:", error);
       }
     }
+    await recoveryLoopPromise;
+    await disconnectRedis();
+    console.log("Worker Shutdown complete");
   } catch (error) {
     console.error("Worker startup failed:", error);
     process.exit(1);
@@ -44,24 +58,28 @@ async function processJob(job) {
   console.log(`Processing job ${job.id}`);
 
   let heartbeatRunning = false;
+  let heartbeatPromise = Promise.resolve();
 
-  const heartbeat = setInterval(async () => {
+  const heartbeat = setInterval(() => {
     // Prevent overlapping heartbeats requests
     if (heartbeatRunning) return;
+
     heartbeatRunning = true;
 
-    try {
-      const renewed = await renewJobLease(job);
-      if (renewed) {
-        console.log(`Lease renewed for job ${job.id}`);
-      } else {
-        console.warn(`Lease lost for job ${job.id}`);
+    heartbeatPromise = (async () => {
+      try {
+        const renewed = await renewJobLease(job);
+        if (renewed) {
+          console.log(`Lease renewed for job ${job.id}`);
+        } else {
+          console.warn(`Lease lost for job ${job.id}`);
+        }
+      } catch (error) {
+        console.error(`Heartbeat error for job ${job.id}:`, error);
+      } finally {
+        heartbeatRunning = false;
       }
-    } catch (error) {
-      console.error(`Heartbeat error for job ${job.id}:`, error);
-    } finally {
-      heartbeatRunning = false;
-    }
+    })();
   }, HEARTBEAT_INTERVAL);
 
   // Simulate of job begin processed
@@ -70,20 +88,21 @@ async function processJob(job) {
     console.log(`Job ${job.id} completed`);
   } finally {
     clearInterval(heartbeat);
+    await heartbeatPromise;
   }
 }
 
 async function startRecoveryLoop() {
-  while (true) {
+  while (!isShuttingDown) {
     try {
       // console.log("Recovery loop checking expired jobs...");
       await recoverExpiredJobs();
     } catch (error) {
       console.error("Recovery error: ", error);
     }
-    
     await new Promise((resolve) => setTimeout(resolve, 1000));
   }
+  console.log("Recovery loop stopped");
 }
 
 startWorker();

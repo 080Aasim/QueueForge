@@ -1,4 +1,3 @@
-
 import "dotenv/config";
 import { createClient } from "redis";
 
@@ -28,3 +27,14 @@ export const connectRedis = async () => {
 
   console.log("Redis connected");
 };
+
+export const disconnectRedis = async () => {
+  if(blockingRedis.isOpen) {
+    await blockingRedis.quit();
+  }
+  if(redis.isOpen) {
+    await redis.quit();
+  }
+  console.log("Redis Connection closed");
+  
+}
