@@ -5,6 +5,7 @@ const WAITING_QUEUE = "jobs:waiting"; // List, Jobs waiting to be claimed
 const PROCESSING_QUEUE = "jobs:processing"; // Sorted set, Lease deadlines
 const PROCESSING_LIST = "jobs:processing:list"; // List, Jobs currently claimed by workers
 const FAILED_QUEUE = "jobs:failed"; //List, Jobs that exhausted retries
+const JOBS_DATA = "jobs:data"; // This preserve the job info. independently of the processing queues
 
 const CLAIMING_QUEUE = "jobs:claiming";
 const CLAIM_GRACE_PERIOD = 5000;
@@ -24,7 +25,11 @@ export async function addJob(job) {
       createdAt: job.createdAt || Date.now(),
     });
 
-    await redis.lPush(WAITING_QUEUE, jobData);
+    // await redis.lPush(WAITING_QUEUE, jobData);
+    const transaction = redis.multi();
+    transaction.lPush(WAITING_QUEUE, jobData);
+    transaction.hSet(JOBS_DATA, job.id, jobData);
+    await transaction.exec();
 
     console.log(`Job ${job.id} added to waiting queue`);
 
@@ -44,12 +49,14 @@ const CLAIM_JOB_SCRIPT = `
 
   local job = cjson.decode(jobData)
   job.attempts = (job.attempts or 0) + 1
+  job.status = "processing"
 
   local updatedJob = cjson.encode(job)
   local deadline = tonumber(ARGV[1])
 
   redis.call('LSET', KEYS[2], -1, updatedJob)
   redis.call('ZADD', KEYS[3], deadline, updatedJob)
+  redis.call('HSET', KEYS[4], job.id, updatedJob)
 
   return updatedJob
 `;
@@ -59,7 +66,7 @@ export async function claimJob() {
 
   // Atomically move job from waiting to processing list
   const result = await redis.eval(CLAIM_JOB_SCRIPT, {
-    keys: [WAITING_QUEUE, PROCESSING_LIST, PROCESSING_QUEUE],
+    keys: [WAITING_QUEUE, PROCESSING_LIST, PROCESSING_QUEUE, JOBS_DATA],
     arguments: [visibilityDeadline.toString()],
   });
 
@@ -81,8 +88,11 @@ export async function acknowledgeJob(job) {
       local currentJob = cjson.decode(jobData)
 
       if currentJob.id == ARGV[1] then
+        currentJob.status = "completed"
+        local updatedJob = cjson.encode(currentJob)
         redis.call('LREM', KEYS[1], 1, jobData)
         redis.call('ZREM', KEYS[2], jobData)
+        redis.call('HSET', KEYS[3], currentJob.id, updatedJob)
         return 1
       end
     end
@@ -91,7 +101,7 @@ export async function acknowledgeJob(job) {
   `;
 
   const result = await redis.eval(script, {
-    keys: [PROCESSING_LIST, PROCESSING_QUEUE],
+    keys: [PROCESSING_LIST, PROCESSING_QUEUE, JOBS_DATA],
     arguments: [String(job.id)],
   });
 
@@ -105,16 +115,14 @@ export async function acknowledgeJob(job) {
 export async function recoverExpiredJobs() {
   const now = Date.now();
 
-  const expiredJobs = await redis.zRangeByScore(
-    PROCESSING_QUEUE,
-    0,
-    now,
-  );
+  const expiredJobs = await redis.zRangeByScore(PROCESSING_QUEUE, 0, now);
 
   const script = `
     local jobData = ARGV[1]
     local job = cjson.decode(jobData)
 
+    -- Recheck lease because it may have been renewed
+    -- after expiredJobs was initially fetched.
     local score = redis.call('ZSCORE', KEYS[1], jobData)
 
     if not score or tonumber(score) > tonumber(ARGV[2]) then
@@ -135,27 +143,28 @@ export async function recoverExpiredJobs() {
     end
 
     if job.attempts >= tonumber(ARGV[3]) then
-      redis.call('LPUSH', KEYS[3], jobData)
+      job.status = "failed"
+      local updatedJob = cjson.encode(job)
+
+      redis.call('LPUSH', KEYS[3], updatedJob)
+      redis.call('HSET', KEYS[5], job.id, updatedJob)
+
       return 2
     else
-      redis.call('LPUSH', KEYS[2], jobData)
+      job.status = "waiting"
+      local updatedJob = cjson.encode(job)
+
+      redis.call('LPUSH', KEYS[2], updatedJob)
+      redis.call('HSET', KEYS[5], job.id, updatedJob)
+
       return 1
     end
   `;
 
   for (const jobData of expiredJobs) {
     const result = await redis.eval(script, {
-      keys: [
-        PROCESSING_QUEUE,
-        WAITING_QUEUE,
-        FAILED_QUEUE,
-        PROCESSING_LIST,
-      ],
-      arguments: [
-        jobData,
-        now.toString(),
-        MAX_ATTEMPTS.toString(),
-      ],
+      keys: [PROCESSING_QUEUE, WAITING_QUEUE, FAILED_QUEUE, PROCESSING_LIST, JOBS_DATA],
+      arguments: [jobData, now.toString(), MAX_ATTEMPTS.toString()],
     });
 
     const job = JSON.parse(jobData);
@@ -263,12 +272,29 @@ export async function renewJobLease(job) {
 
   const result = await redis.eval(script, {
     keys: [PROCESSING_QUEUE],
-    arguments: [
-      String(job.id),
-      now.toString(),
-      newDeadline.toString(),
-    ],
+    arguments: [String(job.id), now.toString(), newDeadline.toString()],
   });
 
   return result === 1;
 }
+
+export async function getJobById(jobId){
+  const jobData = await redis.hGet(JOBS_DATA, jobId);
+  if(!jobData) return null;
+
+  return JSON.parse(jobData);
+}
+
+export async function getAllJobs(){
+  const jobs = await redis.hGetAll(JOBS_DATA);
+
+  return Object.values(jobs).map((jobData) => JSON.parse(jobData));
+}
+
+export async function getJobsByStatus(status) {
+  const jobs = await getAllJobs();
+
+  return jobs.filter((job) => job.status === status);
+}
+
+

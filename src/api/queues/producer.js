@@ -6,7 +6,7 @@ export async function createJob(type, payload) {
     id: uuid(),
     type,
     payload,
-    status: "queued",
+    status: "waiting",
     attempts: 0,
     createdAt: new Date().toISOString(),
   };
