@@ -1,4 +1,4 @@
-import { redis, blockingRedis } from "../../config/redis.js";
+import { redis } from "../../config/redis.js";
 
 // const QUEUE_NAME = "jobs";
 const WAITING_QUEUE = "jobs:waiting"; // List, Jobs waiting to be claimed
@@ -6,6 +6,8 @@ const PROCESSING_QUEUE = "jobs:processing"; // Sorted set, Lease deadlines
 const PROCESSING_LIST = "jobs:processing:list"; // List, Jobs currently claimed by workers
 const FAILED_QUEUE = "jobs:failed"; //List, Jobs that exhausted retries
 const JOBS_DATA = "jobs:data"; // This preserve the job info. independently of the processing queues
+const JOBS_CREATED = "jobs:created"; // Sorted set containing job IDs, ordered by creation
+const JOBS_SEQUENCE = "jobs:sequence"; // Redis counter that generates uniques ordering scores
 
 const CLAIMING_QUEUE = "jobs:claiming";
 const CLAIM_GRACE_PERIOD = 5000;
@@ -16,7 +18,7 @@ const CLAIM_GRACE_PERIOD = 5000;
 const VISIBILITY_TIMEOUT = 30 * 1000;
 const MAX_ATTEMPTS = 3;
 
-// Create an async function to add to job to queue using redis.lPush
+// Create an async function to add to job to queue.
 export async function addJob(job) {
   try {
     const jobData = JSON.stringify({
@@ -25,11 +27,25 @@ export async function addJob(job) {
       createdAt: job.createdAt || Date.now(),
     });
 
-    // await redis.lPush(WAITING_QUEUE, jobData);
-    const transaction = redis.multi();
-    transaction.lPush(WAITING_QUEUE, jobData);
-    transaction.hSet(JOBS_DATA, job.id, jobData);
-    await transaction.exec();
+    const script = `
+      local sequence = redis.call('INCR', KEYS[4])
+
+      redis.call('LPUSH', KEYS[1], ARGV[1])
+      redis.call('HSET', KEYS[2], ARGV[2], ARGV[1])
+      redis.call('ZADD', KEYS[3], sequence, ARGV[2])
+
+      return sequence
+    `;
+
+    await redis.eval(script, {
+      keys: [
+        WAITING_QUEUE,
+        JOBS_DATA,
+        JOBS_CREATED,
+        JOBS_SEQUENCE,
+      ],
+      arguments: [jobData, String(job.id)],
+    });
 
     console.log(`Job ${job.id} added to waiting queue`);
 
@@ -163,7 +179,13 @@ export async function recoverExpiredJobs() {
 
   for (const jobData of expiredJobs) {
     const result = await redis.eval(script, {
-      keys: [PROCESSING_QUEUE, WAITING_QUEUE, FAILED_QUEUE, PROCESSING_LIST, JOBS_DATA],
+      keys: [
+        PROCESSING_QUEUE,
+        WAITING_QUEUE,
+        FAILED_QUEUE,
+        PROCESSING_LIST,
+        JOBS_DATA,
+      ],
       arguments: [jobData, now.toString(), MAX_ATTEMPTS.toString()],
     });
 
@@ -181,69 +203,6 @@ export async function recoverExpiredJobs() {
   }
 }
 
-// export async function recoverExpiredJobs() {
-//   const now = Date.now();
-
-//   const expiredJobs = await redis.zRangeByScore(PROCESSING_QUEUE, 0, now);
-
-//   console.log("Recovery timestamp:", now);
-//   console.log("Expired jobs found:", expiredJobs.length);
-
-//   const script = `
-//     local removed = redis.call('ZREM', KEYS[1], ARGV[1])
-
-//     if removed == 1 then
-//       local job = cjson.decode(ARGV[1])
-
-//       if job.attempts >= tonumber(ARGV[2]) then
-//         redis.call('LPUSH', KEYS[3], ARGV[1])
-//         return 2
-//       else
-//         redis.call('LPUSH', KEYS[2], ARGV[1])
-//         return 1
-//       end
-//     end
-
-//     return 0
-//   `;
-
-//   for (const jobData of expiredJobs) {
-//     const job = JSON.parse(jobData);
-
-//     console.log("Attempting recovery for job:", job.id);
-//     console.log("Calling recovery Lua script...");
-
-//     const result = await redis.eval(script, {
-//       keys: [PROCESSING_QUEUE, WAITING_QUEUE, FAILED_QUEUE],
-//       arguments: [jobData, MAX_ATTEMPTS.toString()],
-//     });
-
-//     console.log("Lua script finished:", result);
-
-//     try {
-//       const result = await redis.eval(script, {
-//         keys: [PROCESSING_QUEUE, WAITING_QUEUE, FAILED_QUEUE],
-//         arguments: [jobData, MAX_ATTEMPTS.toString()],
-//       });
-
-//       console.log("Recovery Lua result:", result);
-
-//       if (result === 1) {
-//         console.log(
-//           `Job ${job.id} recovered and re-queued. Attempt: ${job.attempts}`,
-//         );
-//       } else if (result === 2) {
-//         console.log(
-//           `Job ${job.id} exceeded max attempts and moved to failed queue`,
-//         );
-//       } else {
-//         console.warn(`Job ${job.id} was not recovered. Result: ${result}`);
-//       }
-//     } catch (error) {
-//       console.error(`Failed to recover job ${job.id}:`, error);
-//     }
-//   }
-// }
 
 export async function renewJobLease(job) {
   const now = Date.now();
@@ -278,14 +237,14 @@ export async function renewJobLease(job) {
   return result === 1;
 }
 
-export async function getJobById(jobId){
+export async function getJobById(jobId) {
   const jobData = await redis.hGet(JOBS_DATA, jobId);
-  if(!jobData) return null;
+  if (!jobData) return null;
 
   return JSON.parse(jobData);
 }
 
-export async function getAllJobs(){
+export async function getAllJobs() {
   const jobs = await redis.hGetAll(JOBS_DATA);
 
   return Object.values(jobs).map((jobData) => JSON.parse(jobData));
@@ -298,3 +257,58 @@ export async function getJobsByStatus(status) {
 }
 
 
+export async function getJobsPaginated(
+  cursor = "0",
+  limit = 10,
+  status = null,
+) {
+  let nextCursor = String(cursor);
+  const jobs = [];
+
+  while (jobs.length < limit) {
+    const remaining = limit - jobs.length;
+
+    const ids = await redis.zRangeByScore(
+      JOBS_CREATED,
+      nextCursor === "0" ? "-inf" : `(${nextCursor}`,
+      "+inf",
+      {
+        LIMIT: {
+          offset: 0,
+          count: remaining,
+        },
+      },
+    );
+
+    if (ids.length === 0) {
+      nextCursor = "0";
+      break;
+    }
+
+    for (const id of ids) {
+      const jobData = await redis.hGet(JOBS_DATA, id);
+
+      if (!jobData) continue;
+
+      const job = JSON.parse(jobData);
+
+      if (!status || job.status === status) {
+        jobs.push(job);
+      }
+    }
+
+    const lastId = ids[ids.length - 1];
+    nextCursor = String(await redis.zScore(JOBS_CREATED, lastId));
+
+    if (ids.length < remaining) {
+      nextCursor = "0";
+      break;
+    }
+  }
+
+  return {
+    jobs,
+    count: jobs.length,
+    nextCursor,
+  };
+}

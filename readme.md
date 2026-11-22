@@ -1,4 +1,4 @@
-# Distributed Job System: Atomic Job Claiming, Lease Renewal, Crash Recovery & Job Status Tracking
+# Distributed Job System: Atomic Job Processing, Crash Recovery, Job Status Tracking & Cursor Pagination
 
 ## 1. Objective
 
@@ -17,7 +17,7 @@ Implement a reliable distributed job queue where multiple workers can process jo
 
 ## 2. Redis Queue Architecture
 
-The system uses five Redis data structures.
+The system uses Redis Lists, Sorted Sets, and Hashes. The queue lifecycle uses five primary structures, while two additional keys provide a stable creation-order index for paginated job listing.
 
 | Redis Key | Data Structure | Purpose |
 |---|---|---|
@@ -25,7 +25,9 @@ The system uses five Redis data structures.
 | `jobs:processing:list` | List | Stores jobs currently claimed by workers |
 | `jobs:processing` | Sorted Set | Stores jobs with their lease expiration timestamps |
 | `jobs:failed` | List | Stores jobs that exceeded maximum retries |
-| `jobs:data` | Hash | Stores the latest job record, indexed by job ID, for status tracking |
+| `jobs:data` | Hash | Stores the latest job record, indexed by job ID, for lookup and status tracking |
+| `jobs:created` | Sorted Set | Stores job IDs ordered by a unique creation sequence score for pagination |
+| `jobs:sequence` | String (integer counter) | Generates monotonically increasing scores for newly created jobs |
 
 ### Why use both a List and a Sorted Set for processing?
 
@@ -376,16 +378,19 @@ processing
 
 ### Updating the registry
 
-When a job is created, the producer writes it to both the waiting List and the registry using a Redis transaction:
+When a job is created, the producer uses a Lua script to update the waiting List, central registry, creation index, and sequence counter atomically:
 
-```js
-const transaction = redis.multi();
+```lua
+local sequence = redis.call('INCR', KEYS[4])
 
-transaction.lPush(WAITING_QUEUE, jobData);
-transaction.hSet(JOBS_DATA, job.id, jobData);
+redis.call('LPUSH', KEYS[1], ARGV[1])
+redis.call('HSET', KEYS[2], ARGV[2], ARGV[1])
+redis.call('ZADD', KEYS[3], sequence, ARGV[2])
 
-await transaction.exec();
+return sequence
 ```
+
+The keys are `jobs:waiting`, `jobs:data`, `jobs:created`, and `jobs:sequence`. The generated sequence is the Sorted Set score, and the job ID is its member. Using one Lua script keeps the queue, registry, and creation index in sync during job creation.
 
 The Lua scripts then update the same registry as the job changes state:
 
@@ -402,8 +407,9 @@ The jobs router is mounted at `/api/jobs`.
 | Method | Endpoint | Description |
 |---|---|---|
 | `POST` | `/api/jobs` | Create a job |
-| `GET` | `/api/jobs` | Retrieve all registered jobs |
-| `GET` | `/api/jobs?status=waiting` | Filter jobs by status |
+| `GET` | `/api/jobs` | Retrieve a page of registered jobs |
+| `GET` | `/api/jobs?status=waiting` | Retrieve a page filtered by status |
+| `GET` | `/api/jobs?limit=10&cursor=2` | Retrieve the next page after a creation-sequence cursor |
 | `GET` | `/api/jobs/:id` | Retrieve one job by ID |
 
 Supported status query values:
@@ -416,6 +422,58 @@ Supported status query values:
 Unsupported status values return `400 Bad Request` and include the valid status values.
 
 A request for a job ID that does not exist returns `404 Not Found`.
+
+### Cursor-based pagination with a Sorted Set
+
+The job-listing endpoint uses `jobs:created` instead of scanning the `jobs:data` Hash with `HSCAN`. `HSCAN` is an iteration command, not a stable page API: its `COUNT` value is a hint, and scan results are not suitable for predictable page boundaries.
+
+The creation index contains:
+
+- Member: job ID.
+- Score: monotonically increasing sequence from `jobs:sequence`.
+
+The canonical job JSON remains in `jobs:data`. For each page, the application:
+
+1. Reads job IDs from `jobs:created` in ascending score order, starting strictly after the supplied cursor.
+2. Fetches each corresponding job record from `jobs:data`.
+3. Applies the optional status filter.
+4. Continues scanning subsequent IDs when status filtering leaves the page short.
+5. Returns the matching jobs and the last scanned sequence score as `nextCursor`.
+
+Example requests:
+
+```http
+GET /api/jobs?limit=2
+GET /api/jobs?limit=2&cursor=2
+GET /api/jobs?limit=2&status=completed
+GET /api/jobs?limit=2&status=completed&cursor=2
+```
+
+Query parameters:
+
+| Parameter | Purpose | Validation / behavior |
+|---|---|---|
+| `limit` | Maximum number of matching jobs in the response | Integer from 1 to 100; defaults to 10 |
+| `cursor` | Last scanned creation-sequence score from the previous response | Non-negative integer; defaults to `0` |
+| `status` | Optional job status filter | `waiting`, `processing`, `completed`, or `failed` |
+
+A cursor of `0` starts from the beginning. A non-zero cursor is exclusive, so the next page starts after that score and does not repeat the previous page's last job. `nextCursor: "0"` indicates that the scan reached the end of the creation index. When a page exactly fills its limit at the end of the index, the client may need one additional request to receive an empty page and the terminal cursor.
+
+Status filtering is performed while scanning the creation index, not through separate status-specific Sorted Sets. A filtered page may therefore need to scan more than `limit` IDs to collect enough matching jobs.
+
+### Pagination test results
+
+The test dataset contained 9 jobs: 8 completed and 1 waiting. With `limit=2`, the completed-job query returned all 8 completed jobs across four pages. The tests verified:
+
+- Pages contained no more than 2 matching jobs.
+- Job IDs did not repeat between pages.
+- Results followed creation-sequence order.
+- Status filtering returned only matching jobs.
+- Requesting beyond the final completed-job cursor returned an empty `jobs` array, `count: 0`, and `nextCursor: "0"`.
+
+**Result: PASSED for the tested dataset.**
+
+Pagination is cursor-based, but it is not a snapshot across multiple HTTP requests. If a job's status changes between page requests, later pages can reflect the updated status.
 
 ### Redis data-access functions
 
@@ -458,13 +516,14 @@ The following endpoints were tested using Postman:
 - `POST /api/jobs`
 - `GET /api/jobs`
 - `GET /api/jobs?status=completed`
+- `GET /api/jobs?limit=2`
+- `GET /api/jobs?limit=2&cursor=2`
+- `GET /api/jobs?limit=2&status=completed`
 - `GET /api/jobs/:id`
 
-The tests verified job creation, listing, status filtering, retrieval by ID, invalid status handling, and the not-found response for an unknown job ID.
+The tests verified job creation, paginated listing, status filtering, retrieval by ID, invalid status handling, cursor and limit validation, and the not-found response for an unknown job ID.
 
 **Result: PASSED.**
-
-**Current implementation note:** `getAllJobs()` reads the entire Redis Hash, and `getJobsByStatus()` filters the retrieved jobs in application memory. Pagination and more scalable status indexing are future improvements.
 
 ---
 
@@ -658,13 +717,115 @@ ZCARD jobs:processing
 LLEN jobs:failed
 HGETALL jobs:data
 HGET jobs:data <JOB_ID>
+ZCARD jobs:created
+GET jobs:sequence
+ZRANGE jobs:created 0 -1 WITHSCORES
 ```
 
-`jobs:data` is a Hash, so use `HGET` or `HGETALL` to inspect it. Do not use List commands such as `LLEN` on this key.
+`jobs:data` is a Hash, so use `HGET` or `HGETALL` to inspect it. Do not use List commands such as `LLEN` on this key. `jobs:created` is a Sorted Set, so use `ZCARD` and `ZRANGE` to inspect the pagination index; `jobs:sequence` is an integer counter, so use `GET`.
 
 ---
 
-## 12. Important Redis Commands Learned
+## 12. Challenges Encountered and Solutions Implemented
+
+This section records the main engineering problems encountered while building and testing the queue, along with the changes used to solve them.
+
+### Challenge 1: A job could be lost between claiming and registering it
+
+**Problem:** The initial flow used separate Redis commands to remove a job from the waiting queue and register it in the processing Sorted Set. If a worker stopped between those commands, the job could be removed from the waiting queue without being tracked as processing.
+
+**Solution:** Replaced the multi-command claim flow with one Lua script using `LMOVE`. The script moves the job, increments its attempt count, changes its status, registers its lease deadline, and updates `jobs:data` atomically.
+
+**Outcome:** The claim transition and its Redis bookkeeping now execute as one atomic operation.
+
+### Challenge 2: The processing List and lease Sorted Set needed matching job records
+
+**Problem:** Claiming a job changes its JSON by updating `attempts` and `status`. The original JSON in the processing List therefore needed to be replaced, and the same updated record needed to be stored in the lease Sorted Set and central registry.
+
+**Solution:** The claim Lua script uses `LSET` to replace the last item moved into the processing List, then writes the updated job to `jobs:processing` and `jobs:data`.
+
+**Outcome:** The processing structures and registry receive the same logical job state during a claim.
+
+### Challenge 3: JSON string equality was unreliable during acknowledgement and recovery
+
+**Problem:** JavaScript `JSON.stringify()` and Redis Lua `cjson.encode()` can serialize the same object with different property ordering. Comparing the serialized strings directly could fail even when they represented the same job.
+
+**Solution:** Locate the job by its unique `id`. Acknowledgement and recovery decode the stored JSON and compare IDs before removing the corresponding processing-list entry.
+
+**Outcome:** Queue operations rely on stable job identity instead of serialized-string equality.
+
+### Challenge 4: A worker crash could leave a job stuck in processing
+
+**Problem:** When a worker is forcefully terminated, it stops renewing its lease. The job remains in the processing structures until the lease expires.
+
+**Solution:** Added a recovery loop that checks `jobs:processing` for expired lease scores. A Lua script rechecks the lease deadline before changing anything, removes the job from both processing structures, and either requeues it or moves it to `jobs:failed`.
+
+**Outcome:** Expired jobs can be recovered without relying on the original worker restarting. The in-script lease recheck also prevents acting on a stale expiration result if the lease was renewed after the initial lookup.
+
+### Challenge 5: Retried jobs needed a finite stopping point
+
+**Problem:** A job that repeatedly crashes or never completes must not circulate through the waiting queue forever.
+
+**Solution:** Increment `attempts` on every claim and enforce `MAX_ATTEMPTS = 3`. When the third attempt's lease expires, recovery moves the job to the failed queue and records status `failed` in `jobs:data`.
+
+**Outcome:** The system has a bounded retry policy and a failed-job destination.
+
+### Challenge 6: Long-running jobs could be recovered while still active
+
+**Problem:** A job may run longer than its 30-second visibility timeout. Without renewal, the recovery loop could mistake a healthy worker for a crashed one.
+
+**Solution:** Added a heartbeat that renews the lease every 5 seconds. Renewal checks that the lease still exists and has not already expired before extending its deadline.
+
+**Outcome:** Active workers can retain ownership of jobs that take longer than the initial visibility timeout.
+
+### Challenge 7: Graceful shutdown and crash recovery needed different behavior
+
+**Problem:** Stopping a worker with Ctrl+C should not be treated as a crash. Exiting immediately could interrupt an active job, while stopping its heartbeat too early could allow another worker to recover the same job.
+
+**Solution:** The graceful-shutdown flow stops new claims, allows the active job to finish, keeps its heartbeat running, acknowledges the job, stops the recovery loop, and then closes Redis connections. Crash recovery was tested separately by forcefully terminating the worker process.
+
+**Outcome:** The graceful-shutdown test confirmed that an active job could finish before exit; the separate forced-termination test confirmed lease-based recovery by another worker.
+
+### Challenge 8: Job information disappeared from active queues after completion
+
+**Problem:** Completed jobs are removed from the waiting and processing structures. Those structures alone could not support lookup of a job after it finished.
+
+**Solution:** Introduced `jobs:data`, a Redis Hash keyed by job ID. Creation, claiming, acknowledgement, and recovery update the registry as part of their respective Lua scripts.
+
+**Outcome:** The API can retrieve a job and its latest status independently of its current queue location.
+
+### Challenge 9: HSCAN did not provide reliable API pagination
+
+**Problem:** The first listing implementation used `HSCAN` with a cursor and `COUNT`. During testing, page sizes varied and a job from a previous page appeared again. `COUNT` is a scan hint, and an HSCAN cursor is an iteration cursor rather than a stable page boundary.
+
+**Solution:** Added a creation-order index:
+
+- `jobs:created` is a Sorted Set whose members are job IDs.
+- `jobs:sequence` is an incrementing counter used as each job's unique score.
+- `jobs:data` remains the canonical store for job JSON.
+
+New job creation updates the waiting List, registry Hash, creation Sorted Set, and sequence counter in one Lua script. A one-time migration sorted existing records by `createdAt`, populated the index with scores, and initialized the counter. The migration checks whether either index key already exists so it does not overwrite an existing index.
+
+**Outcome:** Listing now uses score-based pagination. The next request starts strictly after the previous cursor score, avoiding the duplicate-page behavior seen with HSCAN.
+
+### Challenge 10: Status filtering could leave a page short
+
+**Problem:** A page may encounter job IDs whose current status does not match the requested filter. Fetching only `limit` IDs could therefore return fewer than `limit` matching jobs even when more matching jobs exist later in the creation index.
+
+**Solution:** Continue scanning the creation index until the page contains the requested number of matching jobs or the index is exhausted. The cursor tracks the last scanned creation score, not merely the last returned matching job.
+
+**Outcome:** The tested dataset returned all 8 completed jobs across four pages of 2, without duplicate IDs. A request beyond the final completed-job cursor returned an empty page and `nextCursor: "0"`.
+
+### Practical limitations identified during testing
+
+- Pagination is not a snapshot across multiple HTTP requests. A job whose status changes between requests may appear or disappear from later filtered pages.
+- Status filtering scans the shared creation index. For very large datasets, separate status-specific indexes may reduce the amount of scanning.
+- The current implementation fetches job records individually from `jobs:data`; batched reads such as `HMGET` can reduce Redis round trips later.
+- If a page exactly fills its limit at the end of the index, the client may make one additional request to receive the terminal empty page with `nextCursor: "0"`.
+
+---
+
+## 13. Important Redis Commands Learned
 
 | Command | Purpose |
 |---|---|
@@ -678,7 +839,9 @@ HGET jobs:data <JOB_ID>
 | `ZREM` | Remove a member from a Sorted Set |
 | `ZSCORE` | Retrieve a member's score |
 | `ZRANGE` | Retrieve Sorted Set members |
-| `ZRANGEBYSCORE` | Retrieve members within a score range |
+| `ZRANGEBYSCORE` | Retrieve members within a score range; used for cursor pagination and expired-job lookup |
+| `ZCARD` | Get the number of members in a Sorted Set |
+| `INCR` | Atomically increment the job creation sequence counter |
 | `ZCARD` | Get Sorted Set cardinality |
 | `HSET` | Set a field in a Hash |
 | `HGET` | Retrieve a field from a Hash |
@@ -688,7 +851,7 @@ HGET jobs:data <JOB_ID>
 
 ---
 
-## 13. Key Engineering Concepts Learned
+## 14. Key Engineering Concepts Learned
 
 **1. Atomicity**
 
@@ -732,10 +895,10 @@ A worker finishes and acknowledges its active job before closing its connections
 
 ---
 
-## 14. Future Improvements
+## 15. Future Improvements
 
-- Pagination for job listing endpoints.
-- More scalable status filtering and indexing.
+- Add status-specific Sorted Set indexes if status-filtered listing needs to scale beyond scanning the creation index.
+- Use `HMGET` or batched reads to reduce Redis round trips when fetching page records.
 - Better empty-queue polling or blocking notification.
 - Monitoring and metrics for workers and queues.
 - Job priorities.
@@ -761,6 +924,8 @@ The system supports:
 - Retry limits and failed-job handling.
 - Graceful worker shutdown.
 - Centralized job status tracking.
+- Cursor-based job pagination using a Sorted Set creation index.
+- Optional status filtering during pagination.
 - REST endpoints to create, list, filter, and retrieve jobs.
 
-**Core job lifecycle, crash-recovery, graceful-shutdown, and job-status API tests passed.**
+**Core job lifecycle, crash-recovery, graceful-shutdown, job-status API, and tested pagination flows passed.**

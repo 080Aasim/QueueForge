@@ -1,6 +1,9 @@
 import express from "express";
 import { createJob } from "../queues/producer.js";
-import { getAllJobs, getJobsByStatus, getJobById } from "../queues/queue.js";
+import {
+  getJobById,
+  getJobsPaginated,
+} from "../queues/queue.js";
 
 const router = express.Router();
 
@@ -29,7 +32,7 @@ router.post("/", async (req, res) => {
 
 router.get("/", async (req, res) => {
   try {
-    const { status } = req.query;
+    const { status, cursor = "0", limit = "10" } = req.query;
     const validStatuses = ["waiting", "processing", "completed", "failed"];
 
     if (status && !validStatuses.includes(status)) {
@@ -38,11 +41,21 @@ router.get("/", async (req, res) => {
         validStatuses,
       });
     }
-    const jobs = status ? await getJobsByStatus(status) : await getAllJobs();
-    return res.status(200).json({
-      count: jobs.length,
-      jobs,
-    });
+    if(!/^\d+$/.test(cursor)){
+      return res.status(400).json({
+        message: "Invalid cursor",
+      })
+    }
+    const parsedLimit = Number(limit);
+    if(!Number.isInteger(parsedLimit) || parsedLimit < 1 || parsedLimit > 100) {
+      return res.status(400).json({
+        message: "Limit must be between 1 and 100",
+      })
+    }
+    const result = await getJobsPaginated(
+      cursor, parsedLimit, status || null
+    );
+    return res.status(200).json(result);
   } catch (error) {
     console.error("Failed to retrieve jobs:", error);
     return res.status(500).json({
