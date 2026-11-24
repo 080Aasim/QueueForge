@@ -1,0 +1,17 @@
+
+config:
+  target: "http://localhost:4000"
+  phases:
+    - duration: 30
+      arrivalRate: 50
+      name: "Baseline load"
+
+scenarios:
+  - name: "Create jobs"
+    flow:
+      - post:
+          url: "/api/jobs"
+          json:
+            type: "load-test"
+            payload:
+              message: "Artillery test job"

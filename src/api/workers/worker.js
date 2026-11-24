@@ -5,8 +5,13 @@ import {
   renewJobLease,
 } from "../queues/queue.js";
 import { connectRedis, disconnectRedis } from "../../config/redis.js";
+import { pathToFileURL } from "node:url";
 
-const HEARTBEAT_INTERVAL = 5 * 1000; // 5 seconds
+const HEARTBEAT_INTERVAL = Number(
+  process.env.WORKER_HEARTBEAT_INTERVAL || 5000,
+);
+
+const JOB_PROCESSING_TIME = Number(process.env.JOB_PROCESSING_TIME || 30000);
 // For grace full shutdown
 let isShuttingDown = false;
 
@@ -18,8 +23,14 @@ process.on("SIGTERM", () => {
   console.log("\nShutdown signal received (SIGTERM)");
   isShuttingDown = true;
 });
+process.on("message", (message) => {
+  if (message === "shutdown") {
+    console.log("Shutdown message received");
+    isShuttingDown = true;
+  }
+});
 
-async function startWorker() {
+export async function startWorker() {
   try {
     await connectRedis();
     const recoveryLoopPromise = startRecoveryLoop(); // Recover expired jobs before claiming a new job
@@ -48,13 +59,16 @@ async function startWorker() {
     await recoveryLoopPromise;
     await disconnectRedis();
     console.log("Worker Shutdown complete");
+    if (process.connected) {
+      process.disconnect();
+    }
   } catch (error) {
     console.error("Worker startup failed:", error);
     process.exit(1);
   }
 }
 
-async function processJob(job) {
+export async function processJob(job) {
   console.log(`Processing job ${job.id}`);
 
   let heartbeatRunning = false;
@@ -84,7 +98,7 @@ async function processJob(job) {
 
   // Simulate of job begin processed
   try {
-    await new Promise((resolve) => setTimeout(resolve, 30000));
+    await new Promise((resolve) => setTimeout(resolve, JOB_PROCESSING_TIME));
     console.log(`Job ${job.id} completed`);
   } finally {
     clearInterval(heartbeat);
@@ -92,7 +106,7 @@ async function processJob(job) {
   }
 }
 
-async function startRecoveryLoop() {
+export async function startRecoveryLoop() {
   while (!isShuttingDown) {
     try {
       // console.log("Recovery loop checking expired jobs...");
@@ -105,4 +119,9 @@ async function startRecoveryLoop() {
   console.log("Recovery loop stopped");
 }
 
-startWorker();
+if (
+  process.argv[1] &&
+  import.meta.url === pathToFileURL(process.argv[1]).href
+) {
+  startWorker();
+}

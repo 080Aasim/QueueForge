@@ -28,6 +28,12 @@ export async function addJob(job) {
     });
 
     const script = `
+      local exists = redis.call('HEXISTS', KEYS[2], ARGV[2])
+
+      if exists == 1 then
+        return redis.error_reply('Job ID already exists')
+      end
+
       local sequence = redis.call('INCR', KEYS[4])
 
       redis.call('LPUSH', KEYS[1], ARGV[1])
@@ -38,12 +44,7 @@ export async function addJob(job) {
     `;
 
     await redis.eval(script, {
-      keys: [
-        WAITING_QUEUE,
-        JOBS_DATA,
-        JOBS_CREATED,
-        JOBS_SEQUENCE,
-      ],
+      keys: [WAITING_QUEUE, JOBS_DATA, JOBS_CREATED, JOBS_SEQUENCE],
       arguments: [jobData, String(job.id)],
     });
 
@@ -203,7 +204,6 @@ export async function recoverExpiredJobs() {
   }
 }
 
-
 export async function renewJobLease(job) {
   const now = Date.now();
   const newDeadline = now + VISIBILITY_TIMEOUT;
@@ -255,7 +255,6 @@ export async function getJobsByStatus(status) {
 
   return jobs.filter((job) => job.status === status);
 }
-
 
 export async function getJobsPaginated(
   cursor = "0",

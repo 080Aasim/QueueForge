@@ -1,4 +1,4 @@
-# Distributed Job System: Atomic Job Processing, Crash Recovery, Job Status Tracking & Cursor Pagination
+# QueueForge: Distributed Job System with Atomic Processing, Crash Recovery, Cursor Pagination & Load Testing
 
 ## 1. Objective
 
@@ -11,7 +11,9 @@ Implement a reliable distributed job queue where multiple workers can process jo
 - Losing track of jobs whose processing lease expires.
 - Losing access to job information after a job leaves the active queue structures.
 
-**Technology:** Node.js, Redis 6.2.1, JavaScript, Docker, Express.
+**Technology:** Node.js, Express 5, Redis 6.2.1, JavaScript (ES modules), Docker, PostgreSQL, Artillery, and Node.js `node:test`.
+
+The queue coordination and job lifecycle are implemented with Redis Lists, Sorted Sets, Hashes, and Lua scripts. PostgreSQL is also configured in the API application.
 
 ---
 
@@ -708,6 +710,30 @@ Also verified invalid status handling and the not-found response for missing job
 
 **Result: PASSED.**
 
+### Automated test suite
+
+The project uses Node.js' built-in test runner. Tests run sequentially because they share Redis keys and fixtures:
+
+```powershell
+npm test
+```
+
+Latest full-suite result: **28 tests passed, 0 failed**.
+
+| Test file | Tests | Coverage |
+|---|---:|---|
+| `test-acknowledgement.js` | 2 | Successful acknowledgement, processing cleanup, and unknown job handling |
+| `test-job-route.js` | 7 | Job creation, lookup, validation, status handling, and 404 behavior |
+| `test-lease.js` | 4 | Lease renewal, expired lease rejection, requeue, and retry exhaustion |
+| `test-pagination.js` | 5 | Cursor validation, page boundaries, no duplicates, status filtering, and terminal page |
+| `test-producer.js` | 2 | Job creation and atomic duplicate-ID rejection |
+| `test-worker-reliability.js` | 3 | Heartbeat renewal, crash recovery, and graceful shutdown |
+| `test-worker.js` | 4 | Claiming, empty queue, attempt increments, and concurrent claim safety |
+| `test-multi-worker.js` | 1 | Two-worker integration test processing 10 jobs |
+| **Total** | **28** | **All passed** |
+
+The multi-worker integration test uses an isolated Redis database (`DB 1`) so it does not consume jobs from the normal development queue. Both workers processed jobs, all 10 jobs reached `completed`, and each job had one claim in that test run. This is a test observation, not an exactly-once delivery guarantee; the system uses at-least-once processing semantics.
+
 ### Redis verification commands
 
 ```redis
@@ -726,7 +752,77 @@ ZRANGE jobs:created 0 -1 WITHSCORES
 
 ---
 
-## 12. Challenges Encountered and Solutions Implemented
+## 12. Load Testing and Performance Results
+
+Load testing was performed with Artillery against the job-creation API. The API server was running locally, and each scenario submitted jobs through `POST /api/jobs`.
+
+### Artillery configuration
+
+The baseline scenario used a 30-second phase and a fixed arrival rate. The arrival rate was increased between runs while keeping the duration and job payload consistent.
+
+```yaml
+config:
+  target: "http://localhost:4000"
+  phases:
+    - duration: 30
+      arrivalRate: 50
+      name: "Load test"
+
+scenarios:
+  - name: "Create jobs"
+    flow:
+      - post:
+          url: "/api/jobs"
+          json:
+            type: "load-test"
+            payload:
+              message: "Artillery test job"
+```
+
+### API enqueue results
+
+| Arrival rate | Duration | Requests | HTTP 202 accepted | Failed requests | Mean latency | p95 | p99 | Max |
+|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| 20 req/sec | 30 sec | 600 | 600 | 0 | 3.1 ms | 6 ms | 10.9 ms | 31 ms |
+| 50 req/sec | 30 sec | 1,500 | 1,500 | 0 | 5.5 ms | 13.1 ms | 50.9 ms | 196 ms |
+
+All measured requests in these two runs received `202 Accepted`. The 50 req/sec run showed higher tail latency, including a 196 ms maximum, but no failed requests. These numbers describe API job-enqueue performance, not worker execution throughput.
+
+### Four-worker processing throughput
+
+A separate live benchmark measured job consumption with four worker processes. Each worker used a simulated processing duration of 2 seconds. No new jobs were submitted during the 60-second measurement window.
+
+| Metric | Result |
+|---|---:|
+| Worker processes | 4 |
+| Simulated processing time per job | 2 seconds |
+| Theoretical aggregate throughput | 2 jobs/sec |
+| Measurement duration | 60.45 seconds |
+| Waiting queue at start | 1,426 jobs |
+| Waiting queue at end | 1,306 jobs |
+| Jobs consumed during measurement | 120 |
+| Measured throughput | **1.99 jobs/sec** |
+
+The measured rate was approximately 99.5% of the simple theoretical rate of four workers divided by two seconds per job. This is a local benchmark using simulated work; real throughput will depend on job type, CPU, network, Redis latency, and external services.
+
+### Post-benchmark Redis consistency check
+
+After all four workers were stopped gracefully, the final Redis snapshot was:
+
+| Redis key | Value | Interpretation |
+|---|---:|---|
+| `jobs:waiting` | 684 | Remaining backlog; workers were stopped before draining it |
+| `jobs:processing` (`ZCARD`) | 0 | No active lease entries |
+| `jobs:processing:list` (`LLEN`) | 0 | No jobs left in the processing list |
+| `jobs:failed` (`LLEN`) | 0 | No failed entries in the final test state |
+
+The non-empty waiting queue is expected because the benchmark was stopped with work still queued. The important consistency result is that both processing structures were empty after shutdown.
+
+**Benchmark conclusion:** The API accepted the measured 20 and 50 requests/sec workloads without failed requests, the four-worker benchmark sustained 1.99 simulated jobs/sec, and the final processing structures were clean after graceful shutdown.
+
+---
+
+## 13. Challenges Encountered and Solutions Implemented
 
 This section records the main engineering problems encountered while building and testing the queue, along with the changes used to solve them.
 
@@ -825,7 +921,7 @@ New job creation updates the waiting List, registry Hash, creation Sorted Set, a
 
 ---
 
-## 13. Important Redis Commands Learned
+## 14. Important Redis Commands Learned
 
 | Command | Purpose |
 |---|---|
@@ -851,7 +947,7 @@ New job creation updates the waiting List, registry Hash, creation Sorted Set, a
 
 ---
 
-## 14. Key Engineering Concepts Learned
+## 15. Key Engineering Concepts Learned
 
 **1. Atomicity**
 
@@ -895,7 +991,7 @@ A worker finishes and acknowledges its active job before closing its connections
 
 ---
 
-## 15. Future Improvements
+## 16. Future Improvements
 
 - Add status-specific Sorted Set indexes if status-filtered listing needs to scale beyond scanning the creation index.
 - Use `HMGET` or batched reads to reduce Redis round trips when fetching page records.
@@ -928,4 +1024,4 @@ The system supports:
 - Optional status filtering during pagination.
 - REST endpoints to create, list, filter, and retrieve jobs.
 
-**Core job lifecycle, crash-recovery, graceful-shutdown, job-status API, and tested pagination flows passed.**
+**Verified results:** 28/28 automated tests passed; the two-worker integration test completed all 10 jobs; Artillery received 600/600 and 1,500/1,500 successful enqueue responses at 20 and 50 requests/sec; and four workers sustained 1.99 simulated jobs/sec in the measured local benchmark. The final post-shutdown check found no jobs left in either processing structure.
