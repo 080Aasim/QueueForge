@@ -9,6 +9,7 @@ import {
   claimJob,
   recoverExpiredJobs,
   acknowledgeJob,
+  renewJobLease
 } from "./src/api/queues/queue.js";
 
 import { spawn } from "node:child_process";
@@ -191,6 +192,58 @@ describe("Worker Reliability", () => {
       assert.equal(completedJob.status, "completed");
     },
   );
+  it("Should reject stale worker renewal and acknowledgement after a job is reclaimed", async () => {
+    const jobId = randomUUID();
+    jobIds.push(jobId);
+
+    await addJob({
+      id: jobId,
+      type: "email",
+      payload: { to: "stale-worker-test@example.com" },
+      status: "waiting",
+    });
+
+    // Worker A claims the job.
+    const workerAJob = await claimJob();
+
+    assert.equal(workerAJob.id, jobId);
+    assert.ok(workerAJob.claimToken);
+
+    // Simulate Worker A's lease expiring.
+    await redis.zAdd("jobs:processing", {
+      score: Date.now() - 1000,
+      value: JSON.stringify(workerAJob),
+    });
+
+    // Recover and let Worker B claim the same job.
+    await recoverExpiredJobs();
+
+    const workerBJob = await claimJob();
+
+    assert.equal(workerBJob.id, jobId);
+    assert.notEqual(workerBJob.claimToken, workerAJob.claimToken);
+
+    // Worker A wakes up with its stale job object.
+    const renewed = await renewJobLease(workerAJob);
+    assert.equal(renewed, false);
+
+    await acknowledgeJob(workerAJob);
+
+    // Worker B must still own the processing job.
+    const processingJobs = await redis.lRange("jobs:processing:list", 0, -1);
+
+    const activeJob = processingJobs
+      .map((item) => JSON.parse(item))
+      .find((item) => item.id === jobId);
+
+    assert.ok(activeJob);
+    assert.equal(activeJob.claimToken, workerBJob.claimToken);
+
+    const storedJob = JSON.parse(await redis.hGet("jobs:data", jobId));
+
+    assert.equal(storedJob.status, "processing");
+    assert.equal(storedJob.claimToken, workerBJob.claimToken);
+  });
 
   after(async () => {
     try {

@@ -1,4 +1,5 @@
 import { redis } from "../../config/redis.js";
+import { randomUUID } from "node:crypto";
 
 // const QUEUE_NAME = "jobs";
 const WAITING_QUEUE = "jobs:waiting"; // List, Jobs waiting to be claimed
@@ -67,6 +68,7 @@ const CLAIM_JOB_SCRIPT = `
   local job = cjson.decode(jobData)
   job.attempts = (job.attempts or 0) + 1
   job.status = "processing"
+  job.claimToken = ARGV[2]
 
   local updatedJob = cjson.encode(job)
   local deadline = tonumber(ARGV[1])
@@ -82,9 +84,10 @@ export async function claimJob() {
   const visibilityDeadline = Date.now() + VISIBILITY_TIMEOUT;
 
   // Atomically move job from waiting to processing list
+  const claimToken = randomUUID();
   const result = await redis.eval(CLAIM_JOB_SCRIPT, {
     keys: [WAITING_QUEUE, PROCESSING_LIST, PROCESSING_QUEUE, JOBS_DATA],
-    arguments: [visibilityDeadline.toString()],
+    arguments: [visibilityDeadline.toString(), claimToken],
   });
 
   if (!result) return null;
@@ -104,8 +107,9 @@ export async function acknowledgeJob(job) {
     for _, jobData in ipairs(processingJobs) do
       local currentJob = cjson.decode(jobData)
 
-      if currentJob.id == ARGV[1] then
+      if currentJob.id == ARGV[1] and currentJob.claimToken == ARGV[2] then
         currentJob.status = "completed"
+        currentJob.claimToken = nil
         local updatedJob = cjson.encode(currentJob)
         redis.call('LREM', KEYS[1], 1, jobData)
         redis.call('ZREM', KEYS[2], jobData)
@@ -119,7 +123,7 @@ export async function acknowledgeJob(job) {
 
   const result = await redis.eval(script, {
     keys: [PROCESSING_LIST, PROCESSING_QUEUE, JOBS_DATA],
-    arguments: [String(job.id)],
+    arguments: [String(job.id), String(job.claimToken)],
   });
 
   if (result === 1) {
@@ -158,6 +162,7 @@ export async function recoverExpiredJobs() {
         break
       end
     end
+    job.claimToken = nil
 
     if job.attempts >= tonumber(ARGV[3]) then
       job.status = "failed"
@@ -214,14 +219,14 @@ export async function renewJobLease(job) {
     for _, jobData in ipairs(jobs) do
       local currentJob = cjson.decode(jobData)
 
-      if currentJob.id == ARGV[1] then
+      if currentJob.id == ARGV[1] and currentJob.claimToken == ARGV[2] then
         local score = redis.call('ZSCORE', KEYS[1], jobData)
 
-        if tonumber(score) <= tonumber(ARGV[2]) then
+        if tonumber(score) <= tonumber(ARGV[3]) then
           return 0
         end
 
-        redis.call('ZADD', KEYS[1], ARGV[3], jobData)
+        redis.call('ZADD', KEYS[1], ARGV[4], jobData)
         return 1
       end
     end
@@ -231,7 +236,12 @@ export async function renewJobLease(job) {
 
   const result = await redis.eval(script, {
     keys: [PROCESSING_QUEUE],
-    arguments: [String(job.id), now.toString(), newDeadline.toString()],
+    arguments: [
+      String(job.id),
+      String(job.claimToken),
+      now.toString(),
+      newDeadline.toString(),
+    ],
   });
 
   return result === 1;
