@@ -10,8 +10,9 @@ Implement a reliable distributed job queue where multiple workers can process jo
 - Leaving completed jobs in processing queues.
 - Losing track of jobs whose processing lease expires.
 - Losing access to job information after a job leaves the active queue structures.
+- Allowing stale workers to acknowledge or renew jobs reclaimed by another worker.
 
-**Technology:** Node.js, Express 5, Redis 6.2.1, JavaScript (ES modules), Docker, PostgreSQL, Artillery, and Node.js `node:test`.
+**Technology:** Node.js, Express 5, Redis 8, Redis Node.js client (`redis` ^6.2.1), JavaScript (ES modules), Docker, PostgreSQL 18, Artillery, and Node.js `node:test`.
 
 The queue coordination and job lifecycle are implemented with Redis Lists, Sorted Sets, Hashes, and Lua scripts. PostgreSQL is also configured in the API application.
 
@@ -19,7 +20,7 @@ The queue coordination and job lifecycle are implemented with Redis Lists, Sorte
 
 ## 2. Redis Queue Architecture
 
-The system uses Redis Lists, Sorted Sets, and Hashes. The queue lifecycle uses five primary structures, while two additional keys provide a stable creation-order index for paginated job listing.
+The system uses Redis Lists, Sorted Sets, and Hashes.
 
 | Redis Key | Data Structure | Purpose |
 |---|---|---|
@@ -27,20 +28,18 @@ The system uses Redis Lists, Sorted Sets, and Hashes. The queue lifecycle uses f
 | `jobs:processing:list` | List | Stores jobs currently claimed by workers |
 | `jobs:processing` | Sorted Set | Stores jobs with their lease expiration timestamps |
 | `jobs:failed` | List | Stores jobs that exceeded maximum retries |
-| `jobs:data` | Hash | Stores the latest job record, indexed by job ID, for lookup and status tracking |
-| `jobs:created` | Sorted Set | Stores job IDs ordered by a unique creation sequence score for pagination |
+| `jobs:data` | Hash | Stores the latest job record, indexed by job ID |
+| `jobs:created` | Sorted Set | Stores job IDs ordered by a unique creation sequence score |
 | `jobs:sequence` | String (integer counter) | Generates monotonically increasing scores for newly created jobs |
 
 ### Why use both a List and a Sorted Set for processing?
 
 **Processing List:**
-
 - Keeps the actual claimed job data.
 - Allows us to locate jobs by their ID.
-- Helps maintain a record of jobs currently being processed.
+- Maintains a record of jobs currently being processed.
 
 **Processing Sorted Set:**
-
 - Stores the job as its member.
 - Stores its lease expiration timestamp as its score.
 - Allows efficient identification of expired jobs using `ZRANGEBYSCORE`.
@@ -49,7 +48,7 @@ The two processing structures are maintained together.
 
 ### Why use a separate `jobs:data` Hash?
 
-The active queue structures change as a job moves through its lifecycle. For example, a completed job is removed from the processing List and Sorted Set. The `jobs:data` Hash preserves its latest record so it can still be retrieved by ID.
+The active queue structures change as a job moves through its lifecycle. The `jobs:data` Hash preserves its latest record so it can still be retrieved by ID after completion or failure.
 
 - Hash key: `jobs:data`
 - Hash field: job ID
@@ -70,11 +69,11 @@ Initially, we used two separate Redis operations:
 
 If a worker crashed between these operations, the job could disappear from the waiting queue without being registered in processing.
 
-This created a job-loss scenario.
-
 ### Solution: Lua Script + LMOVE
 
 We replaced the separate operations with a single Lua script.
+
+Each successful claim also receives a unique `claimToken`, generated using Node.js `randomUUID()`. This token identifies the specific worker attempt that currently owns the job.
 
 ```lua
 local jobData = redis.call('LMOVE', KEYS[1], KEYS[2], 'LEFT', 'RIGHT')
@@ -86,6 +85,7 @@ end
 local job = cjson.decode(jobData)
 job.attempts = (job.attempts or 0) + 1
 job.status = "processing"
+job.claimToken = ARGV[2]
 
 local updatedJob = cjson.encode(job)
 local deadline = tonumber(ARGV[1])
@@ -102,15 +102,16 @@ return updatedJob
 1. `LMOVE` moves a job from the waiting list to the processing list.
 2. Redis decodes the job JSON.
 3. The attempt counter is incremented.
-4. The job status is changed to `processing`.
-5. A visibility deadline is calculated.
-6. `LSET` updates the job inside the processing list.
-7. `ZADD` registers the job and its lease deadline.
-8. `HSET` updates the job record in the central registry.
+4. The job status changes to `processing`.
+5. The unique claim token is stored in the job.
+6. A visibility deadline is calculated.
+7. `LSET` updates the job inside the processing list.
+8. `ZADD` registers the job and its lease deadline.
+9. `HSET` updates the job record in the central registry.
 
 All operations happen inside one Lua script.
 
-**Important concept: Redis Lua atomicity**
+### Redis Lua atomicity
 
 Redis executes a Lua script atomically. Other Redis commands cannot interleave with the script's execution.
 
@@ -118,9 +119,14 @@ This closes the crash window between moving a job and registering its lease.
 
 ### JavaScript `claimJob()`
 
+The JavaScript function generates a new token for every claim attempt:
+
 ```js
+import { randomUUID } from "node:crypto";
+
 export async function claimJob() {
   const visibilityDeadline = Date.now() + VISIBILITY_TIMEOUT;
+  const claimToken = randomUUID();
 
   const result = await redis.eval(CLAIM_JOB_SCRIPT, {
     keys: [
@@ -129,7 +135,10 @@ export async function claimJob() {
       PROCESSING_QUEUE,
       JOBS_DATA,
     ],
-    arguments: [visibilityDeadline.toString()],
+    arguments: [
+      visibilityDeadline.toString(),
+      claimToken,
+    ],
   });
 
   if (!result) return null;
@@ -144,6 +153,20 @@ export async function claimJob() {
 ```
 
 We use non-blocking `LMOVE`, so `claimJob()` returns `null` when the queue is empty. The worker waits one second and tries again.
+
+### Claim token and job ownership
+
+A job ID identifies the job itself, but it does not identify which worker attempt currently owns it.
+
+The `claimToken` solves this problem:
+
+- Every successful claim receives a unique token.
+- A reclaimed job receives a different token.
+- Lease renewal requires the current token.
+- Acknowledgement requires the current token.
+- Recovery clears the old token before requeueing or failing the job.
+
+This prevents a worker with an outdated job object from modifying a newer processing attempt.
 
 ---
 
@@ -173,14 +196,14 @@ To prevent this, the worker periodically renews its lease.
 
 ### Lease renewal implementation
 
-We search the sorted set for the job using its unique ID.
+The renewal Lua script verifies:
 
-The Lua script:
+1. The job exists in the processing structure.
+2. The job ID matches.
+3. The claim token matches the current worker attempt.
+4. The existing lease has not expired.
 
-1. Finds the job in the sorted set.
-2. Checks whether its lease still exists.
-3. Checks whether the lease has already expired.
-4. Updates the lease deadline if it is still valid.
+Only if these checks pass is the lease deadline extended.
 
 The new deadline is:
 
@@ -190,11 +213,13 @@ const newDeadline = Date.now() + VISIBILITY_TIMEOUT;
 
 The renewal operation is atomic.
 
-### Why check the old deadline?
+### Why check both the deadline and claim token?
 
 A worker should not be allowed to renew a lease that has already expired.
 
-If the deadline has passed, the renewal fails and the recovery mechanism can take over.
+It should also not be allowed to renew a job that another worker has reclaimed.
+
+The claim token prevents an outdated worker from renewing the lease belonging to a newer worker attempt.
 
 ---
 
@@ -208,7 +233,7 @@ After successful processing, the job must be removed from both processing struct
 
 ### Implementation
 
-We use the job ID instead of relying on matching serialized JSON.
+Acknowledgement matches both the job ID and its claim token.
 
 ```js
 export async function acknowledgeJob(job) {
@@ -218,8 +243,12 @@ export async function acknowledgeJob(job) {
     for _, jobData in ipairs(processingJobs) do
       local currentJob = cjson.decode(jobData)
 
-      if currentJob.id == ARGV[1] then
+      if currentJob.id == ARGV[1]
+        and currentJob.claimToken == ARGV[2] then
+
         currentJob.status = "completed"
+        currentJob.claimToken = nil
+
         local updatedJob = cjson.encode(currentJob)
 
         redis.call('LREM', KEYS[1], 1, jobData)
@@ -235,7 +264,10 @@ export async function acknowledgeJob(job) {
 
   const result = await redis.eval(script, {
     keys: [PROCESSING_LIST, PROCESSING_QUEUE, JOBS_DATA],
-    arguments: [String(job.id)],
+    arguments: [
+      String(job.id),
+      String(job.claimToken),
+    ],
   });
 
   if (result === 1) {
@@ -246,11 +278,23 @@ export async function acknowledgeJob(job) {
 }
 ```
 
-### Why use job ID?
+### Why use job ID and claim token?
 
-Redis Lua's `cjson.encode()` and JavaScript's `JSON.stringify()` are not guaranteed to produce identical serialized JSON strings.
+The job ID identifies the job, while the claim token identifies its current processing attempt.
 
-Searching by a unique job ID avoids depending on exact JSON serialization.
+Matching both prevents a stale worker from acknowledging a job that has already been reclaimed.
+
+Redis Lua's `cjson.encode()` and JavaScript's `JSON.stringify()` are not guaranteed to produce identical serialized JSON strings. Matching by job identity avoids depending on exact JSON serialization.
+
+### Clearing the claim token
+
+After successful acknowledgement:
+
+```lua
+currentJob.claimToken = nil
+```
+
+The completed job no longer needs an active ownership token.
 
 The processing removals and registry update happen atomically inside Lua.
 
@@ -298,9 +342,10 @@ For every expired job:
 1. Verify that its lease is still expired.
 2. Remove it from the processing sorted set.
 3. Find and remove the corresponding job from the processing list using its ID.
-4. Check the attempt counter.
-5. Either requeue it or move it to the failed queue.
-6. Update its status and central registry record.
+4. Clear its old claim token.
+5. Check the attempt counter.
+6. Either requeue it or move it to the failed queue.
+7. Update its status and central registry record.
 
 These operations are executed inside a Lua script.
 
@@ -308,10 +353,12 @@ These operations are executed inside a Lua script.
 
 ```text
 If attempts < MAX_ATTEMPTS:
+    Clear claimToken
     Move job to jobs:waiting
     Set status to waiting
 
 If attempts >= MAX_ATTEMPTS:
+    Clear claimToken
     Move job to jobs:failed
     Set status to failed
 ```
@@ -323,6 +370,14 @@ const MAX_ATTEMPTS = 3;
 ```
 
 The recovery operation checks the lease again inside Lua to avoid acting on stale results from the initial expired-job lookup.
+
+### Why clear the claim token during recovery?
+
+The old worker's ownership has expired.
+
+If the job is requeued, the next worker receives a fresh claim token when it claims the job.
+
+This prevents the previous worker from renewing or acknowledging the new processing attempt.
 
 ---
 
@@ -350,61 +405,15 @@ A job that completes successfully is acknowledged and removed instead of being r
 
 ## 8. Job Status Tracking API
 
-### Why job status tracking?
+The job registry, status lifecycle, API endpoints, cursor pagination, and Redis data-access functions remain as previously documented.
 
-The processing and waiting queues represent where a job currently resides. However, completed jobs are removed from the processing structures. The `jobs:data` Hash keeps the latest job record available after queue transitions.
+The central `jobs:data` Hash preserves the latest job record after it leaves the active queue structures.
 
-Each job has one of four statuses:
+The creation-order index uses `jobs:created` and `jobs:sequence` to provide cursor-based pagination.
 
-| Status | Meaning |
-|---|---|
-| `waiting` | The job is waiting to be claimed |
-| `processing` | A worker has claimed the job |
-| `completed` | The job was successfully processed and acknowledged |
-| `failed` | The job exhausted its maximum retry attempts |
-
-### Status lifecycle
-
-```text
-waiting
-   |
-   v
-processing
-   |
-   +---- successful acknowledgement ----> completed
-   |
-   +---- lease expires, attempts remain -> waiting
-   |
-   +---- lease expires, attempts maxed --> failed
-```
-
-### Updating the registry
-
-When a job is created, the producer uses a Lua script to update the waiting List, central registry, creation index, and sequence counter atomically:
-
-```lua
-local sequence = redis.call('INCR', KEYS[4])
-
-redis.call('LPUSH', KEYS[1], ARGV[1])
-redis.call('HSET', KEYS[2], ARGV[2], ARGV[1])
-redis.call('ZADD', KEYS[3], sequence, ARGV[2])
-
-return sequence
-```
-
-The keys are `jobs:waiting`, `jobs:data`, `jobs:created`, and `jobs:sequence`. The generated sequence is the Sorted Set score, and the job ID is its member. Using one Lua script keeps the queue, registry, and creation index in sync during job creation.
-
-The Lua scripts then update the same registry as the job changes state:
-
-- Claim: status becomes `processing`.
-- Acknowledgement: status becomes `completed`.
-- Recovery: status becomes `waiting` or `failed`.
-
-This keeps the queue transition and the corresponding status update together within each Lua script.
+**Important:** Pagination is not a snapshot across multiple HTTP requests. If a job's status changes between page requests, later pages can reflect the updated status.
 
 ### Available API endpoints
-
-The jobs router is mounted at `/api/jobs`.
 
 | Method | Endpoint | Description |
 |---|---|---|
@@ -414,311 +423,57 @@ The jobs router is mounted at `/api/jobs`.
 | `GET` | `/api/jobs?limit=10&cursor=2` | Retrieve the next page after a creation-sequence cursor |
 | `GET` | `/api/jobs/:id` | Retrieve one job by ID |
 
-Supported status query values:
-
-- `waiting`
-- `processing`
-- `completed`
-- `failed`
-
-Unsupported status values return `400 Bad Request` and include the valid status values.
-
-A request for a job ID that does not exist returns `404 Not Found`.
-
-### Cursor-based pagination with a Sorted Set
-
-The job-listing endpoint uses `jobs:created` instead of scanning the `jobs:data` Hash with `HSCAN`. `HSCAN` is an iteration command, not a stable page API: its `COUNT` value is a hint, and scan results are not suitable for predictable page boundaries.
-
-The creation index contains:
-
-- Member: job ID.
-- Score: monotonically increasing sequence from `jobs:sequence`.
-
-The canonical job JSON remains in `jobs:data`. For each page, the application:
-
-1. Reads job IDs from `jobs:created` in ascending score order, starting strictly after the supplied cursor.
-2. Fetches each corresponding job record from `jobs:data`.
-3. Applies the optional status filter.
-4. Continues scanning subsequent IDs when status filtering leaves the page short.
-5. Returns the matching jobs and the last scanned sequence score as `nextCursor`.
-
-Example requests:
-
-```http
-GET /api/jobs?limit=2
-GET /api/jobs?limit=2&cursor=2
-GET /api/jobs?limit=2&status=completed
-GET /api/jobs?limit=2&status=completed&cursor=2
-```
-
-Query parameters:
-
-| Parameter | Purpose | Validation / behavior |
-|---|---|---|
-| `limit` | Maximum number of matching jobs in the response | Integer from 1 to 100; defaults to 10 |
-| `cursor` | Last scanned creation-sequence score from the previous response | Non-negative integer; defaults to `0` |
-| `status` | Optional job status filter | `waiting`, `processing`, `completed`, or `failed` |
-
-A cursor of `0` starts from the beginning. A non-zero cursor is exclusive, so the next page starts after that score and does not repeat the previous page's last job. `nextCursor: "0"` indicates that the scan reached the end of the creation index. When a page exactly fills its limit at the end of the index, the client may need one additional request to receive an empty page and the terminal cursor.
-
-Status filtering is performed while scanning the creation index, not through separate status-specific Sorted Sets. A filtered page may therefore need to scan more than `limit` IDs to collect enough matching jobs.
-
-### Pagination test results
-
-The test dataset contained 9 jobs: 8 completed and 1 waiting. With `limit=2`, the completed-job query returned all 8 completed jobs across four pages. The tests verified:
-
-- Pages contained no more than 2 matching jobs.
-- Job IDs did not repeat between pages.
-- Results followed creation-sequence order.
-- Status filtering returned only matching jobs.
-- Requesting beyond the final completed-job cursor returned an empty `jobs` array, `count: 0`, and `nextCursor: "0"`.
-
-**Result: PASSED for the tested dataset.**
-
-Pagination is cursor-based, but it is not a snapshot across multiple HTTP requests. If a job's status changes between page requests, later pages can reflect the updated status.
-
-### Redis data-access functions
-
-Retrieve a job by ID:
-
-```js
-export async function getJobById(jobId) {
-  const jobData = await redis.hGet(JOBS_DATA, jobId);
-
-  if (!jobData) return null;
-
-  return JSON.parse(jobData);
-}
-```
-
-Retrieve all jobs:
-
-```js
-export async function getAllJobs() {
-  const jobs = await redis.hGetAll(JOBS_DATA);
-
-  return Object.values(jobs).map((jobData) => JSON.parse(jobData));
-}
-```
-
-Filter jobs by status:
-
-```js
-export async function getJobsByStatus(status) {
-  const jobs = await getAllJobs();
-
-  return jobs.filter((job) => job.status === status);
-}
-```
-
-### API testing
-
-The following endpoints were tested using Postman:
-
-- `POST /api/jobs`
-- `GET /api/jobs`
-- `GET /api/jobs?status=completed`
-- `GET /api/jobs?limit=2`
-- `GET /api/jobs?limit=2&cursor=2`
-- `GET /api/jobs?limit=2&status=completed`
-- `GET /api/jobs/:id`
-
-The tests verified job creation, paginated listing, status filtering, retrieval by ID, invalid status handling, cursor and limit validation, and the not-found response for an unknown job ID.
-
-**Result: PASSED.**
-
 ---
 
 ## 9. Worker Implementation
 
-### Main worker lifecycle
+The worker lifecycle, configuration, heartbeat behavior, and processing flow remain as previously documented.
 
-```text
-Connect to Redis
-      |
-Start recovery loop
-      |
-Claim job
-      |
-Is a job available?
-   /       \
- No         Yes
- |           |
-Wait 1 sec  Process job
- |           |
-Retry       Heartbeat renews lease
-             |
-         Job completed
-             |
-         Acknowledge
-             |
-         Claim next job
-```
+The worker:
 
-### Worker configuration
+- Connects to Redis.
+- Starts the recovery loop.
+- Claims available jobs.
+- Processes jobs while renewing their leases.
+- Acknowledges successfully completed jobs.
+- Stops gracefully when requested.
 
-| Setting | Value |
-|---|---:|
-| Visibility timeout | 30 seconds |
-| Heartbeat interval | 5 seconds |
-| Simulated processing time | 30 seconds |
-| Recovery interval | 1 second |
-| Maximum attempts | 3 |
-| Empty queue polling delay | 1 second |
+The worker's lease renewal and acknowledgement operations now validate the job's current claim token.
 
-The heartbeat continues while the job is being processed.
-
-The worker acknowledges the job only after successful completion.
-
-If processing fails or the worker crashes, the job remains unacknowledged and can eventually be recovered after its lease expires.
+This protects against stale worker operations after a job has been reclaimed.
 
 ---
 
 ## 10. Graceful Worker Shutdown
 
-### Why graceful shutdown?
+Graceful shutdown behavior remains unchanged.
 
-A worker may receive a shutdown signal while it is processing a job. Exiting immediately could interrupt the job and leave it unacknowledged until its visibility timeout expires.
+The worker:
 
-Graceful shutdown allows the worker to finish its current job before closing its Redis connections.
+1. Stops starting new claim cycles.
+2. Allows the currently claimed job to finish.
+3. Keeps renewing its lease while processing continues.
+4. Acknowledges the job after successful completion.
+5. Stops the recovery loop.
+6. Closes Redis connections gracefully.
 
-### Shutdown behavior
-
-The worker listens for:
-
-- `SIGINT` when the process receives Ctrl + C.
-- `SIGTERM` when the process is asked to terminate.
-
-When either signal is received, the worker sets `isShuttingDown` to `true`.
-
-The shutdown sequence is:
-
-1. Stop the worker from starting another claim cycle.
-2. Allow the currently claimed job to finish.
-3. Keep renewing the job lease while processing continues.
-4. Acknowledge the job after successful completion.
-5. Stop the recovery loop.
-6. Close the Redis connections gracefully.
-7. Finish the worker shutdown.
-
-### Heartbeat during shutdown
-
-The heartbeat must remain active while the current job is processing, even after a shutdown signal arrives. Otherwise, a long-running job could lose its lease and be recovered by another worker before it finishes.
-
-The worker also waits for an in-progress heartbeat renewal to complete before returning from job processing.
-
-### Redis connection cleanup
-
-The Redis clients are closed using `quit()` after the worker and recovery loop have stopped. This gives pending Redis commands an opportunity to complete before the connections close.
-
-### Shutdown test
-
-We tested graceful shutdown by:
-
-1. Starting the worker.
-2. Submitting a job.
-3. Waiting until the worker began processing it.
-4. Pressing Ctrl + C while the job was running.
-5. Observing that heartbeats continued until processing completed.
-
-Observed behavior:
-
-- The shutdown signal was received.
-- The active job continued processing.
-- Lease renewals continued.
-- The job completed and was acknowledged.
-- The recovery loop stopped.
-- Redis connections closed.
-- The worker exited cleanly.
-
-**Result: PASSED.**
+The heartbeat remains active while the current job is processing, even after a shutdown signal arrives.
 
 ---
 
 ## 11. Testing and Results
 
-We performed tests using Postman, Redis CLI, Docker, and multiple worker processes.
+The project uses Node.js' built-in test runner. Tests run sequentially because they share Redis keys and fixtures.
 
-### Test 1: Multiple Workers
-
-Submitted multiple jobs through the API and started two workers.
-
-Results:
-
-- Both workers claimed jobs.
-- Workers processed different jobs concurrently.
-- Jobs were processed and acknowledged.
-
-**Result: PASSED.**
-
-### Test 2: Heartbeat Renewal
-
-Configured:
-
-- Visibility timeout: 30 seconds.
-- Heartbeat interval: 5 seconds.
-- Processing duration: approximately 30 seconds.
-
-Observed repeated successful lease renewals.
-
-**Result: PASSED.**
-
-### Test 3: Job Acknowledgement
-
-After successful processing, the worker acknowledged the job.
-
-Both processing structures were cleaned up, and the registry status became `completed`.
-
-**Result: PASSED.**
-
-### Test 4: Worker Crash Recovery
-
-Crash recovery is different from graceful shutdown. The worker process was forcefully terminated while it owned a job.
-
-Procedure:
-
-1. Added a job.
-2. Started Worker 1.
-3. Let it claim the job.
-4. Forcefully terminated Worker 1 while it was processing.
-5. Waited for its visibility timeout to expire.
-6. Verified that the recovery loop requeued the job.
-7. Started another worker and verified that it could claim the recovered job.
-
-The recovered job's attempt count increased on its next claim.
-
-**Result: PASSED.**
-
-### Test 5: Maximum Retry Handling
-
-With `MAX_ATTEMPTS = 3`, repeatedly terminated workers while they were processing a job.
-
-After the third attempt's lease expired, the recovery loop moved the job to the failed queue and updated its registry status to `failed`.
-
-**Result: PASSED.**
-
-### Test 6: Job Status Tracking API
-
-Tested the following endpoints using Postman:
-
-- `POST /api/jobs`
-- `GET /api/jobs`
-- `GET /api/jobs?status=completed`
-- `GET /api/jobs/:id`
-
-Also verified invalid status handling and the not-found response for missing job IDs.
-
-**Result: PASSED.**
-
-### Automated test suite
-
-The project uses Node.js' built-in test runner. Tests run sequentially because they share Redis keys and fixtures:
+Run the suite using:
 
 ```powershell
 npm test
 ```
 
-Latest full-suite result: **28 tests passed, 0 failed**.
+### Automated test suite
+
+Latest full-suite result: **29 tests passed, 0 failed**.
 
 | Test file | Tests | Coverage |
 |---|---:|---|
@@ -727,12 +482,31 @@ Latest full-suite result: **28 tests passed, 0 failed**.
 | `test-lease.js` | 4 | Lease renewal, expired lease rejection, requeue, and retry exhaustion |
 | `test-pagination.js` | 5 | Cursor validation, page boundaries, no duplicates, status filtering, and terminal page |
 | `test-producer.js` | 2 | Job creation and atomic duplicate-ID rejection |
-| `test-worker-reliability.js` | 3 | Heartbeat renewal, crash recovery, and graceful shutdown |
+| `test-worker-reliability.js` | 4 | Heartbeat renewal, crash recovery, graceful shutdown, and stale worker ownership protection |
 | `test-worker.js` | 4 | Claiming, empty queue, attempt increments, and concurrent claim safety |
 | `test-multi-worker.js` | 1 | Two-worker integration test processing 10 jobs |
-| **Total** | **28** | **All passed** |
+| **Total** | **29** | **All passed** |
 
-The multi-worker integration test uses an isolated Redis database (`DB 1`) so it does not consume jobs from the normal development queue. Both workers processed jobs, all 10 jobs reached `completed`, and each job had one claim in that test run. This is a test observation, not an exactly-once delivery guarantee; the system uses at-least-once processing semantics.
+The multi-worker integration test uses an isolated Redis database (`DB 1`) so it does not consume jobs from the normal development queue.
+
+Both workers processed jobs, all 10 jobs reached `completed`, and each job had one claim in that test run.
+
+This is a test observation, not an exactly-once delivery guarantee. The system uses at-least-once processing semantics.
+
+### Stale worker ownership regression test
+
+A regression test verifies the following scenario:
+
+1. Worker A claims a job.
+2. Worker A's lease expires.
+3. Recovery requeues the job.
+4. Worker B claims the same job with a new claim token.
+5. Worker A attempts to renew its old lease.
+6. Worker A attempts to acknowledge the job.
+7. Both stale operations are rejected.
+8. Worker B retains ownership of the processing job.
+
+This verifies that an outdated worker cannot acknowledge or renew a job reclaimed by another worker.
 
 ### Redis verification commands
 
@@ -748,36 +522,11 @@ GET jobs:sequence
 ZRANGE jobs:created 0 -1 WITHSCORES
 ```
 
-`jobs:data` is a Hash, so use `HGET` or `HGETALL` to inspect it. Do not use List commands such as `LLEN` on this key. `jobs:created` is a Sorted Set, so use `ZCARD` and `ZRANGE` to inspect the pagination index; `jobs:sequence` is an integer counter, so use `GET`.
-
 ---
 
 ## 12. Load Testing and Performance Results
 
-Load testing was performed with Artillery against the job-creation API. The API server was running locally, and each scenario submitted jobs through `POST /api/jobs`.
-
-### Artillery configuration
-
-The baseline scenario used a 30-second phase and a fixed arrival rate. The arrival rate was increased between runs while keeping the duration and job payload consistent.
-
-```yaml
-config:
-  target: "http://localhost:4000"
-  phases:
-    - duration: 30
-      arrivalRate: 50
-      name: "Load test"
-
-scenarios:
-  - name: "Create jobs"
-    flow:
-      - post:
-          url: "/api/jobs"
-          json:
-            type: "load-test"
-            payload:
-              message: "Artillery test job"
-```
+Load testing was performed with Artillery against the job-creation API.
 
 ### API enqueue results
 
@@ -786,11 +535,13 @@ scenarios:
 | 20 req/sec | 30 sec | 600 | 600 | 0 | 3.1 ms | 6 ms | 10.9 ms | 31 ms |
 | 50 req/sec | 30 sec | 1,500 | 1,500 | 0 | 5.5 ms | 13.1 ms | 50.9 ms | 196 ms |
 
-All measured requests in these two runs received `202 Accepted`. The 50 req/sec run showed higher tail latency, including a 196 ms maximum, but no failed requests. These numbers describe API job-enqueue performance, not worker execution throughput.
+All measured requests in these two runs received `202 Accepted`.
+
+These numbers describe API job-enqueue performance, not worker execution throughput.
 
 ### Four-worker processing throughput
 
-A separate live benchmark measured job consumption with four worker processes. Each worker used a simulated processing duration of 2 seconds. No new jobs were submitted during the 60-second measurement window.
+A separate live benchmark measured job consumption with four worker processes. Each worker used a simulated processing duration of 2 seconds.
 
 | Metric | Result |
 |---|---:|
@@ -803,7 +554,9 @@ A separate live benchmark measured job consumption with four worker processes. E
 | Jobs consumed during measurement | 120 |
 | Measured throughput | **1.99 jobs/sec** |
 
-The measured rate was approximately 99.5% of the simple theoretical rate of four workers divided by two seconds per job. This is a local benchmark using simulated work; real throughput will depend on job type, CPU, network, Redis latency, and external services.
+The measured rate was approximately 99.5% of the simple theoretical rate.
+
+This is a local benchmark using simulated work. Real throughput depends on job type, CPU, network, Redis latency, and external services.
 
 ### Post-benchmark Redis consistency check
 
@@ -811,113 +564,120 @@ After all four workers were stopped gracefully, the final Redis snapshot was:
 
 | Redis key | Value | Interpretation |
 |---|---:|---|
-| `jobs:waiting` | 684 | Remaining backlog; workers were stopped before draining it |
+| `jobs:waiting` | 684 | Remaining backlog |
 | `jobs:processing` (`ZCARD`) | 0 | No active lease entries |
 | `jobs:processing:list` (`LLEN`) | 0 | No jobs left in the processing list |
 | `jobs:failed` (`LLEN`) | 0 | No failed entries in the final test state |
 
-The non-empty waiting queue is expected because the benchmark was stopped with work still queued. The important consistency result is that both processing structures were empty after shutdown.
-
-**Benchmark conclusion:** The API accepted the measured 20 and 50 requests/sec workloads without failed requests, the four-worker benchmark sustained 1.99 simulated jobs/sec, and the final processing structures were clean after graceful shutdown.
+The non-empty waiting queue is expected because the benchmark was stopped with work still queued.
 
 ---
 
 ## 13. Challenges Encountered and Solutions Implemented
 
-This section records the main engineering problems encountered while building and testing the queue, along with the changes used to solve them.
+This section records the main engineering problems encountered while building and testing the queue.
 
 ### Challenge 1: A job could be lost between claiming and registering it
 
-**Problem:** The initial flow used separate Redis commands to remove a job from the waiting queue and register it in the processing Sorted Set. If a worker stopped between those commands, the job could be removed from the waiting queue without being tracked as processing.
+**Problem:** Separate Redis commands could leave a job untracked if a worker stopped between removing it from the waiting queue and registering it in processing.
 
-**Solution:** Replaced the multi-command claim flow with one Lua script using `LMOVE`. The script moves the job, increments its attempt count, changes its status, registers its lease deadline, and updates `jobs:data` atomically.
+**Solution:** Replaced the multi-command claim flow with one Lua script using `LMOVE`.
 
-**Outcome:** The claim transition and its Redis bookkeeping now execute as one atomic operation.
+**Outcome:** The claim transition and its Redis bookkeeping execute atomically.
 
 ### Challenge 2: The processing List and lease Sorted Set needed matching job records
 
-**Problem:** Claiming a job changes its JSON by updating `attempts` and `status`. The original JSON in the processing List therefore needed to be replaced, and the same updated record needed to be stored in the lease Sorted Set and central registry.
+**Problem:** Claiming a job changes its JSON, so the processing structures needed to receive the updated record.
 
-**Solution:** The claim Lua script uses `LSET` to replace the last item moved into the processing List, then writes the updated job to `jobs:processing` and `jobs:data`.
+**Solution:** Used `LSET`, `ZADD`, and `HSET` inside the claim Lua script.
 
 **Outcome:** The processing structures and registry receive the same logical job state during a claim.
 
 ### Challenge 3: JSON string equality was unreliable during acknowledgement and recovery
 
-**Problem:** JavaScript `JSON.stringify()` and Redis Lua `cjson.encode()` can serialize the same object with different property ordering. Comparing the serialized strings directly could fail even when they represented the same job.
+**Problem:** JavaScript and Redis Lua can serialize the same object with different property ordering.
 
-**Solution:** Locate the job by its unique `id`. Acknowledgement and recovery decode the stored JSON and compare IDs before removing the corresponding processing-list entry.
+**Solution:** Locate jobs by unique ID rather than comparing serialized JSON strings.
 
-**Outcome:** Queue operations rely on stable job identity instead of serialized-string equality.
+**Outcome:** Queue operations rely on stable job identity.
 
 ### Challenge 4: A worker crash could leave a job stuck in processing
 
-**Problem:** When a worker is forcefully terminated, it stops renewing its lease. The job remains in the processing structures until the lease expires.
+**Problem:** A crashed worker stops renewing its lease.
 
-**Solution:** Added a recovery loop that checks `jobs:processing` for expired lease scores. A Lua script rechecks the lease deadline before changing anything, removes the job from both processing structures, and either requeues it or moves it to `jobs:failed`.
+**Solution:** Added an expiry recovery loop and Lua-based recovery operations.
 
-**Outcome:** Expired jobs can be recovered without relying on the original worker restarting. The in-script lease recheck also prevents acting on a stale expiration result if the lease was renewed after the initial lookup.
+**Outcome:** Expired jobs can be recovered without requiring the original worker to restart.
 
 ### Challenge 5: Retried jobs needed a finite stopping point
 
-**Problem:** A job that repeatedly crashes or never completes must not circulate through the waiting queue forever.
+**Problem:** Jobs must not circulate through the waiting queue indefinitely.
 
-**Solution:** Increment `attempts` on every claim and enforce `MAX_ATTEMPTS = 3`. When the third attempt's lease expires, recovery moves the job to the failed queue and records status `failed` in `jobs:data`.
+**Solution:** Enforced `MAX_ATTEMPTS = 3`.
 
 **Outcome:** The system has a bounded retry policy and a failed-job destination.
 
 ### Challenge 6: Long-running jobs could be recovered while still active
 
-**Problem:** A job may run longer than its 30-second visibility timeout. Without renewal, the recovery loop could mistake a healthy worker for a crashed one.
+**Problem:** A job may run longer than its initial visibility timeout.
 
-**Solution:** Added a heartbeat that renews the lease every 5 seconds. Renewal checks that the lease still exists and has not already expired before extending its deadline.
+**Solution:** Added a heartbeat that renews the lease every 5 seconds.
 
-**Outcome:** Active workers can retain ownership of jobs that take longer than the initial visibility timeout.
+**Outcome:** Active workers can retain ownership of long-running jobs.
 
 ### Challenge 7: Graceful shutdown and crash recovery needed different behavior
 
-**Problem:** Stopping a worker with Ctrl+C should not be treated as a crash. Exiting immediately could interrupt an active job, while stopping its heartbeat too early could allow another worker to recover the same job.
+**Problem:** Graceful shutdown should allow an active job to finish, whereas a crashed worker must eventually lose ownership.
 
-**Solution:** The graceful-shutdown flow stops new claims, allows the active job to finish, keeps its heartbeat running, acknowledges the job, stops the recovery loop, and then closes Redis connections. Crash recovery was tested separately by forcefully terminating the worker process.
+**Solution:** Implemented graceful shutdown separately from lease-based crash recovery.
 
-**Outcome:** The graceful-shutdown test confirmed that an active job could finish before exit; the separate forced-termination test confirmed lease-based recovery by another worker.
+**Outcome:** Both scenarios are tested independently.
 
 ### Challenge 8: Job information disappeared from active queues after completion
 
-**Problem:** Completed jobs are removed from the waiting and processing structures. Those structures alone could not support lookup of a job after it finished.
+**Problem:** Completed jobs are removed from processing structures.
 
-**Solution:** Introduced `jobs:data`, a Redis Hash keyed by job ID. Creation, claiming, acknowledgement, and recovery update the registry as part of their respective Lua scripts.
+**Solution:** Introduced `jobs:data`, a Redis Hash keyed by job ID.
 
-**Outcome:** The API can retrieve a job and its latest status independently of its current queue location.
+**Outcome:** The API can retrieve jobs independently of their queue location.
 
 ### Challenge 9: HSCAN did not provide reliable API pagination
 
-**Problem:** The first listing implementation used `HSCAN` with a cursor and `COUNT`. During testing, page sizes varied and a job from a previous page appeared again. `COUNT` is a scan hint, and an HSCAN cursor is an iteration cursor rather than a stable page boundary.
+**Problem:** `HSCAN` does not provide stable page boundaries.
 
-**Solution:** Added a creation-order index:
+**Solution:** Added `jobs:created`, a Sorted Set indexed by a monotonically increasing creation sequence.
 
-- `jobs:created` is a Sorted Set whose members are job IDs.
-- `jobs:sequence` is an incrementing counter used as each job's unique score.
-- `jobs:data` remains the canonical store for job JSON.
-
-New job creation updates the waiting List, registry Hash, creation Sorted Set, and sequence counter in one Lua script. A one-time migration sorted existing records by `createdAt`, populated the index with scores, and initialized the counter. The migration checks whether either index key already exists so it does not overwrite an existing index.
-
-**Outcome:** Listing now uses score-based pagination. The next request starts strictly after the previous cursor score, avoiding the duplicate-page behavior seen with HSCAN.
+**Outcome:** Listing now uses score-based pagination.
 
 ### Challenge 10: Status filtering could leave a page short
 
-**Problem:** A page may encounter job IDs whose current status does not match the requested filter. Fetching only `limit` IDs could therefore return fewer than `limit` matching jobs even when more matching jobs exist later in the creation index.
+**Problem:** A page may encounter job IDs that do not match the requested status.
 
-**Solution:** Continue scanning the creation index until the page contains the requested number of matching jobs or the index is exhausted. The cursor tracks the last scanned creation score, not merely the last returned matching job.
+**Solution:** Continue scanning the creation index until the page contains the requested number of matching jobs or the index is exhausted.
 
-**Outcome:** The tested dataset returned all 8 completed jobs across four pages of 2, without duplicate IDs. A request beyond the final completed-job cursor returned an empty page and `nextCursor: "0"`.
+**Outcome:** The tested dataset returned all 8 completed jobs across four pages of 2 without duplicate IDs.
+
+### Challenge 11: A stale worker could acknowledge a job reclaimed by another worker
+
+**Problem:** A worker could become unresponsive long enough for its lease to expire. Recovery would requeue the job, allowing another worker to claim it. However, if the original worker resumed, it could still attempt to renew or acknowledge the job using its outdated job object.
+
+Matching only by job ID could allow the stale worker to interfere with the newer processing attempt.
+
+**Solution:** Introduced a unique `claimToken` using Node.js `randomUUID()` for every successful claim.
+
+The token is stored in the job record and checked by the Lua scripts responsible for lease renewal and acknowledgement.
+
+Recovery clears the old token before requeueing or failing a job, and successful acknowledgement also clears it.
+
+**Outcome:** Only the worker holding the current claim token can renew the lease or acknowledge the job. Stale worker operations are rejected, protecting the ownership of a reclaimed job.
 
 ### Practical limitations identified during testing
 
-- Pagination is not a snapshot across multiple HTTP requests. A job whose status changes between requests may appear or disappear from later filtered pages.
-- Status filtering scans the shared creation index. For very large datasets, separate status-specific indexes may reduce the amount of scanning.
-- The current implementation fetches job records individually from `jobs:data`; batched reads such as `HMGET` can reduce Redis round trips later.
-- If a page exactly fills its limit at the end of the index, the client may make one additional request to receive the terminal empty page with `nextCursor: "0"`.
+- Pagination is not a snapshot across multiple HTTP requests.
+- Status filtering scans the shared creation index.
+- The current implementation fetches job records individually from `jobs:data`.
+- A page that exactly fills its limit at the end of the index may require one additional request to receive the terminal empty page.
+- Claim tokens protect queue ownership, but external job handlers still need idempotency to handle repeated execution safely.
 
 ---
 
@@ -935,10 +695,9 @@ New job creation updates the waiting List, registry Hash, creation Sorted Set, a
 | `ZREM` | Remove a member from a Sorted Set |
 | `ZSCORE` | Retrieve a member's score |
 | `ZRANGE` | Retrieve Sorted Set members |
-| `ZRANGEBYSCORE` | Retrieve members within a score range; used for cursor pagination and expired-job lookup |
+| `ZRANGEBYSCORE` | Retrieve members within a score range |
 | `ZCARD` | Get the number of members in a Sorted Set |
 | `INCR` | Atomically increment the job creation sequence counter |
-| `ZCARD` | Get Sorted Set cardinality |
 | `HSET` | Set a field in a Hash |
 | `HGET` | Retrieve a field from a Hash |
 | `HGETALL` | Retrieve all fields and values from a Hash |
@@ -983,11 +742,17 @@ Using a unique job ID is more reliable than depending on exact JSON serializatio
 
 **9. Central Job Registry**
 
-A Redis Hash makes job records retrievable independently of their queue location and supports status lookup.
+A Redis Hash makes job records retrievable independently of their queue location.
 
 **10. Graceful Shutdown**
 
 A worker finishes and acknowledges its active job before closing its connections.
+
+**11. Worker Ownership and Claim Tokens**
+
+A unique claim token identifies the current processing attempt. It prevents stale workers from renewing or acknowledging jobs after another worker has reclaimed them.
+
+The token acts as an ownership check within the queue. It does not guarantee exactly-once execution of external side effects.
 
 ---
 
@@ -1007,15 +772,17 @@ A worker finishes and acknowledges its active job before closing its connections
 
 ## Final Outcome
 
-Implemented and tested a distributed job processing system using Node.js and Redis Lists, Sorted Sets, and Hashes.
+Implemented and tested a distributed job processing system using Node.js and Redis Lists, Sorted Sets, Hashes, and Lua scripts.
 
 The system supports:
 
 - Concurrent job processing.
 - Atomic job creation and claiming.
+- Unique claim tokens for worker ownership.
 - Lease-based job ownership.
 - Heartbeat-based lease renewal.
 - Atomic acknowledgement.
+- Stale worker protection.
 - Automatic recovery of expired jobs.
 - Retry limits and failed-job handling.
 - Graceful worker shutdown.
@@ -1024,4 +791,8 @@ The system supports:
 - Optional status filtering during pagination.
 - REST endpoints to create, list, filter, and retrieve jobs.
 
-**Verified results:** 28/28 automated tests passed; the two-worker integration test completed all 10 jobs; Artillery received 600/600 and 1,500/1,500 successful enqueue responses at 20 and 50 requests/sec; and four workers sustained 1.99 simulated jobs/sec in the measured local benchmark. The final post-shutdown check found no jobs left in either processing structure.
+**Verified results:** 29/29 automated tests passed; the two-worker integration test completed all 10 jobs; Artillery received 600/600 and 1,500/1,500 successful enqueue responses at 20 and 50 requests/sec; and four workers sustained 1.99 simulated jobs/sec in the measured local benchmark.
+
+The stale-worker regression test also verified that an outdated worker cannot renew or acknowledge a job after another worker has reclaimed it.
+
+The final post-shutdown check found no jobs left in either processing structure.
